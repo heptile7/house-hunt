@@ -1,5 +1,6 @@
 import logging
-from scrapers.base_scraper import BaseScraper, SCRAPER_API_KEY
+
+from scrapers.base_scraper import SCRAPER_API_KEY, BaseScraper
 
 logger = logging.getLogger(__name__)
 
@@ -32,14 +33,15 @@ class PlaywrightScraper(BaseScraper):
         Requires SCRAPER_API_KEY in .env.
         """
         from playwright.sync_api import sync_playwright
+
         self._pw_mgr = sync_playwright()
-        self._pw     = self._pw_mgr.__enter__()
+        self._pw = self._pw_mgr.__enter__()
         self._browser = self._pw.chromium.launch(headless=True, args=_BROWSER_ARGS)
 
         proxy = None
         if use_proxy and SCRAPER_API_KEY:
             proxy = {
-                "server":   "http://proxy.scraperapi.com:8001",
+                "server": "http://proxy.scraperapi.com:8001",
                 "username": "scraperapi",
                 "password": SCRAPER_API_KEY,
             }

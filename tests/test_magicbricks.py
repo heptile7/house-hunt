@@ -38,6 +38,9 @@ def test_first_card_fields():
 
 
 def test_card_without_detail_link_is_skipped():
-    soup = BeautifulSoup('<div class="mb-srp__card"><h2 class="mb-srp__card--title">2 BHK in X</h2>'
-                         '<a href="/some-project-pdpid-abc">p</a></div>', "lxml")
+    soup = BeautifulSoup(
+        '<div class="mb-srp__card"><h2 class="mb-srp__card--title">2 BHK in X</h2>'
+        '<a href="/some-project-pdpid-abc">p</a></div>',
+        "lxml",
+    )
     assert MagicBricksScraper()._parse_cards(soup, "Chennai") == []

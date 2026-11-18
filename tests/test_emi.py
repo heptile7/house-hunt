@@ -1,7 +1,11 @@
 import pytest
 
 from utils.emi_calculator import (
-    calculate_emi, estimate_stamp_duty, estimate_gst, total_cost_breakdown, format_inr,
+    calculate_emi,
+    estimate_gst,
+    estimate_stamp_duty,
+    format_inr,
+    total_cost_breakdown,
 )
 
 
@@ -29,12 +33,15 @@ def test_stamp_duty_by_state():
     assert unknown["stamp_rate"] == 5.0
 
 
-@pytest.mark.parametrize("price, uc, expected", [
-    (4_000_000, False, 0),          # ready-to-move: no GST
-    (9_000_000, False, 0),
-    (4_000_000, True, 40_000),      # affordable under-construction: 1%
-    (9_000_000, True, 450_000),     # other under-construction: 5%
-])
+@pytest.mark.parametrize(
+    "price, uc, expected",
+    [
+        (4_000_000, False, 0),  # ready-to-move: no GST
+        (9_000_000, False, 0),
+        (4_000_000, True, 40_000),  # affordable under-construction: 1%
+        (9_000_000, True, 450_000),  # other under-construction: 5%
+    ],
+)
 def test_gst(price, uc, expected):
     assert estimate_gst(price, uc) == expected
 
@@ -47,10 +54,13 @@ def test_total_cost_breakdown():
     assert r["move_in_cost"] == 1_000_000 + r["total_charges"]
 
 
-@pytest.mark.parametrize("amount, expected", [
-    (25_000_000, "₹2.50 Cr"),
-    (4_500_000, "₹45.00 L"),
-    (18_500, "₹18,500"),
-])
+@pytest.mark.parametrize(
+    "amount, expected",
+    [
+        (25_000_000, "₹2.50 Cr"),
+        (4_500_000, "₹45.00 L"),
+        (18_500, "₹18,500"),
+    ],
+)
 def test_format_inr(amount, expected):
     assert format_inr(amount) == expected

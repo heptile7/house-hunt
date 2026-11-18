@@ -16,3 +16,7 @@ __pycache__/
 .idea/
 Thumbs.db
 .DS_Store
+
+# Claude Code hook state (per machine)
+.claude/hooks/.docs_check_state
+.claude/settings.local.json

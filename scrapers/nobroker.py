@@ -1,184 +1,291 @@
+"""
+NoBroker scraper — plain HTTP, no browser or proxy needed.
+
+NoBroker's list pages are server-rendered and embed the full listing objects:
+  * rent pages (Next.js):  inside the `self.__next_f.push([1, "..."])` flight payload
+  * sale pages (legacy):   inside `nb.appState = {...}` → listPage.listPageProperties
+Every listing object has a `propertyCode` key, which is how we find them.
+
+URL pattern: /flats-for-{rent|sale}-in-{place}_{city}?pageNo=N where {place} is the
+city slug for a city-wide search or a locality slug (e.g. "velachery", "anna_nagar").
+"""
+
+import html
+import json
 import logging
 import re
-import json
-from bs4 import BeautifulSoup
-from scrapers.playwright_base import PlaywrightScraper
+from urllib.parse import unquote, urljoin
+
 from config import CITY_SLUGS
+from scrapers.base_scraper import BaseScraper
+from scrapers.details import ms_to_date, yes_no
 
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.nobroker.in"
-API_URL  = "https://www.nobroker.in/api/v1/search/property/list"
+_KEY = '"propertyCode"'
+_BS = "\\"
+_PUSH_RE = re.compile(r'self\.__next_f\.push\(\[1,("(?:[^"' + _BS * 2 + r"]|" + _BS * 2 + r'.)*")\]\)')
 
 
-class NoBrokerScraper(PlaywrightScraper):
-    source_name = "nobroker"
+def _text(value) -> str:
+    """Owner-typed text: decode HTML entities (&#40; → '(') and collapse whitespace."""
+    return re.sub(r"\s+", " ", html.unescape(str(value or ""))).strip()
 
-    def scrape(self, city: str, bhk: list[int] = None, max_price: int = None, listing_type: str = "buy") -> list[dict]:
-        # NoBroker is a full React SPA. Their JSON API requires auth cookies only set by
-        # a real browser session. ScraperAPI rendering gets only a 11KB shell.
-        # Try the JSON API (fast, no browser) — if it returns 0, fail immediately.
-        city_slug = CITY_SLUGS.get(city, {}).get("nb", city.lower())
-        results = []
-        for page in range(1, self.max_pages + 1):
-            try:
-                props = self._scrape_api(city_slug, city, page, bhk, max_price, listing_type)
-                if not props:
+
+def _image_url(o: dict) -> str:
+    """First photo, medium size. `originalImageUrl` (assets.nobroker.in/<file>) returns 403
+    to everyone; the public path is images.nobroker.in/images/<listing id>/<file>."""
+    for photo in o.get("photos") or []:
+        sizes = (photo or {}).get("imagesMap") or {}
+        name = sizes.get("medium") or sizes.get("large") or sizes.get("original")
+        if name:
+            return f"https://images.nobroker.in/images/{o.get('id')}/{name}"
+    return ""
+
+
+def _furnishing(value) -> str:
+    v = str(value or "").upper()
+    if "SEMI" in v:
+        return "Semi-Furnished"
+    if "FULL" in v:
+        return "Furnished"
+    if "NOT" in v or "UN" in v or "NONE" in v:
+        return "Unfurnished"
+    return "Unknown"
+
+
+# amenitiesMap codes → labels
+_AMENITY_LABELS = {
+    "LIFT": "Lift",
+    "GYM": "Gym",
+    "POOL": "Swimming Pool",
+    "CLUB": "Club House",
+    "PARK": "Park",
+    "CPA": "Children's Play Area",
+    "SECURITY": "Security",
+    "INTERCOM": "Intercom",
+    "PB": "Power Backup",
+    "GP": "Gas Pipeline",
+    "FS": "Fire Safety",
+    "RWH": "Rain Water Harvesting",
+    "STP": "Sewage Treatment Plant",
+    "VP": "Visitor Parking",
+    "HK": "Housekeeping",
+    "AC": "Air Conditioner",
+    "INTERNET": "Internet",
+    "SERVANT": "Servant Room",
+    "SC": "Shopping Centre",
+}
+_TENANTS = {
+    "FAMILY": "Family",
+    "BACHELOR": "Bachelors",
+    "BACHELOR_MALE": "Bachelor (male)",
+    "BACHELOR_FEMALE": "Bachelor (female)",
+    "COMPANY": "Company",
+    "ANYONE": "Anyone",
+}
+
+
+_FACING = {
+    "N": "North", "S": "South", "E": "East", "W": "West",
+    "NE": "North-East", "NW": "North-West", "SE": "South-East", "SW": "South-West",
+}  # fmt: skip
+
+
+def _unquote(value) -> str:
+    """Some owner descriptions arrive percent-encoded, sometimes twice (%25E2%2580%2599 → ’)."""
+    s = str(value or "")
+    for _ in range(2):
+        if not re.search(r"%[0-9A-Fa-f]{2}", s):
+            break
+        s = unquote(s)
+    return s
+
+
+def _attr(o: dict, key: str, display: bool = False) -> str:
+    """Owner-entered attributes in `aea__`, e.g. PET, NON_VEG_ALLOWED, CURRENT_SITUATION."""
+    a = (o.get("aea__") or {}).get(key) or {}
+    return (a.get("display_value") if display else a.get("value")) or ""
+
+
+def _amenities(o: dict) -> list[str]:
+    amap = o.get("amenitiesMap")
+    if not isinstance(amap, dict):
+        try:
+            amap = json.loads(o.get("amenities") or "{}")
+        except (TypeError, ValueError):
+            amap = {}
+    out = [_AMENITY_LABELS.get(k, k.title()) for k, v in amap.items() if v is True]
+    if _attr(o, "GATED_SECURITY") == "YES" and "Gated Security" not in out:
+        out.append("Gated Security")
+    if o.get("parkingDesc") and o.get("parking") not in (None, "", "NONE"):
+        out.append(f"Parking ({o['parkingDesc']})")
+    if str(o.get("powerBackup") or "").upper() in ("FULL", "PARTIAL") and "Power Backup" not in out:
+        out.append(f"Power Backup ({str(o['powerBackup']).title()})")
+    return sorted(set(out))
+
+
+def _tenants(o: dict) -> str:
+    codes = o.get("leaseTypeNew") or ([o["leaseType"]] if o.get("leaseType") else [])
+    return ", ".join(_TENANTS.get(str(c).upper(), str(c).replace("_", " ").title()) for c in codes)
+
+
+def slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_")
+
+
+def listing_objects(html: str) -> list[dict]:
+    """Extract raw NoBroker listing dicts from a list page (either embedding format)."""
+    objs = _from_app_state(html)
+    if objs:
+        return objs
+    flight = "".join(json.loads(m.group(1)) for m in _PUSH_RE.finditer(html))
+    return _objects_with_key(flight) if flight else []
+
+
+def _from_app_state(html: str) -> list[dict]:
+    i = html.find("nb.appState = ")
+    if i < 0:
+        return []
+    try:
+        state, _ = json.JSONDecoder().raw_decode(html, i + len("nb.appState = "))
+    except ValueError:
+        return []
+
+    def walk(o):
+        if isinstance(o, list) and o and isinstance(o[0], dict) and "propertyCode" in o[0]:
+            return o
+        children = o.values() if isinstance(o, dict) else o if isinstance(o, list) else []
+        for c in children:
+            found = walk(c)
+            if found:
+                return found
+        return None
+
+    return walk(state) or []
+
+
+def _objects_with_key(text: str) -> list[dict]:
+    """Find every JSON object in `text` that directly contains the propertyCode key."""
+    dec = json.JSONDecoder()
+    out, seen = [], set()
+    for m in re.finditer(re.escape(_KEY), text):
+        depth, i = 0, m.start()
+        while i > 0:
+            i -= 1
+            ch = text[i]
+            if ch == "}":
+                depth += 1
+            elif ch == "{":
+                if depth == 0:
+                    try:
+                        obj, _ = dec.raw_decode(text, i)
+                    except ValueError:
+                        break
+                    if "propertyCode" in obj and obj.get("id") not in seen:
+                        seen.add(obj.get("id"))
+                        out.append(obj)
                     break
-                results.extend(props)
+                depth -= 1
+    return out
+
+
+class NoBrokerScraper(BaseScraper):
+    source_name = "nobroker"
+    supports_localities = True
+
+    def scrape(
+        self,
+        city: str,
+        bhk: list[int] = None,
+        max_price: int = None,
+        listing_type: str = "buy",
+        localities: list[str] = None,
+    ) -> list[dict]:
+        city_slug = CITY_SLUGS.get(city, {}).get("nb") or slugify(city)
+        places = [slugify(loc) for loc in localities] if localities else [city_slug]
+        pages = self.locality_pages if localities else self.max_pages
+        results, seen = [], set()
+        for place in places:
+            for page in range(1, pages + 1):
+                try:
+                    props = self._scrape_page(place, city_slug, city, page, listing_type)
+                except Exception as e:
+                    logger.warning(f"[NoBroker] {place} page {page} error: {e}")
+                    break
+                new = [p for p in props if p["property_id"] not in seen]
+                if not new:
+                    break
+                seen.update(p["property_id"] for p in new)
+                results.extend(new)
                 self._sleep()
-            except Exception as e:
-                logger.warning(f"[NoBroker] API page {page} error: {e}")
+        return self._filter(results, bhk, max_price)
+
+    def _scrape_page(self, place: str, city_slug: str, city: str, page: int, listing_type: str) -> list[dict]:
+        mode = "rent" if listing_type == "rent" else "sale"
+        url = f"{BASE_URL}/flats-for-{mode}-in-{place}_{city_slug}"
+        if page > 1:
+            url += f"?pageNo={page}"
+        objs = []
+        for attempt in range(2):
+            resp = self._get(url, headers={"Referer": BASE_URL + "/"})
+            objs = listing_objects(resp.text)
+            if objs:
                 break
-        return results
-
-    def _scrape_api(self, city_slug: str, city: str, page: int, bhk, max_price, listing_type: str) -> list[dict]:
-        """Attempt NoBroker's internal search API."""
-        bedroom_filter = [str(b) for b in bhk] if bhk else []
-        payload = {
-            "city": city_slug,
-            "listingType": listing_type,
-            "filter": {
-                "bedrooms": bedroom_filter,
-                "propertyType": ["flat", "independent_house", "villa"],
-                **({"maxPrice": max_price} if max_price else {}),
-            },
-            "page": page,
-            "size": 30,
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Origin": BASE_URL,
-            "Referer": f"{BASE_URL}/property/residential/{city_slug}/buy",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        try:
-            resp = self._post(API_URL, json=payload, headers=headers)
-            data = resp.json()
-            listings = (
-                data.get("data", {}).get("searchResult", []) or
-                data.get("result", []) or
-                data.get("properties", [])
+            # NoBroker intermittently serves a page without listing data after a burst of
+            # requests; one slower retry usually gets the real page.
+            logger.warning(
+                f"[NoBroker] no listing data in {url} ({len(resp.text)} bytes)" + ("; retrying" if attempt == 0 else "")
             )
-            props = [p for item in listings if (p := self._map_api(item, city))]
-            for p in props:
-                p["listing_type"] = listing_type
-            return props
-        except Exception as e:
-            logger.debug(f"[NoBroker] API failed: {e}")
-            return []
+            if attempt == 0:
+                self._sleep(extra=self.delay * 2)
+        return [p for o in objs if (p := self.map_listing(o, city, listing_type))]
 
-    def _map_api(self, item: dict, city: str) -> dict | None:
-        try:
-            prop_id = str(item.get("id") or item.get("propertyId", ""))
-            if not prop_id:
-                return None
-            price = item.get("price") or item.get("expectedPrice") or 0
-            area  = item.get("builtArea") or item.get("carpetArea") or item.get("area") or 0
-            bhk   = item.get("bhk") or item.get("bedroom") or 0
-            loc   = item.get("locality") or item.get("location", "")
-            title = f"{bhk} BHK {item.get('propertyType', 'Apartment')} in {loc}"
-            url   = item.get("url") or f"{BASE_URL}/property/residential/{city.lower()}/buy/{prop_id}"
-            images = item.get("images") or []
-            image_url = images[0].get("url", "") if images else ""
-
-            return self._normalize({
-                "source": self.source_name,
-                "property_id": prop_id,
-                "title": title,
-                "price": int(price),
-                "price_text": self._format_price(int(price)),
-                "area_sqft": float(area),
-                "bhk": int(bhk),
-                "city": city,
-                "locality": loc,
-                "url": url if url.startswith("http") else BASE_URL + url,
-                "image_url": image_url,
-                "furnishing": item.get("furnishing", ""),
-                "floor": str(item.get("floorNumber", "")),
-                "total_floors": int(item.get("totalFloors") or 0),
-                "facing": item.get("facingDirection", ""),
-                "parking": int(item.get("parking") or 0),
-            })
-        except Exception as e:
-            logger.debug(f"[NoBroker] map error: {e}")
+    def map_listing(self, o: dict, city: str, listing_type: str) -> dict | None:
+        prop_id = o.get("id")
+        if not prop_id:
             return None
-
-    def _scrape_html(self, city_slug: str, city: str, page: int, bhk, max_price, listing_type: str) -> list[dict]:
-        """Playwright-rendered NoBroker listing page, with homepage warm-up cookies."""
-        bedroom_str = "-".join(str(b) for b in bhk) + "bhk-" if bhk else ""
-        mode = listing_type
-        url = f"{BASE_URL}/property/residential/{city_slug}/{mode}/{bedroom_str}?page={page}"
-        pw_page = self._context.new_page()
-        try:
-            pw_page.goto(url, wait_until="networkidle", timeout=45_000)
-            # Wait for listing cards or data attributes to appear
-            try:
-                pw_page.wait_for_selector(
-                    ".search-result-card, [data-id], .nb-card, .listingCard",
-                    timeout=10_000,
-                )
-            except Exception:
-                pass
-            pw_page.wait_for_timeout(2_000)
-            html = pw_page.content()
-            soup = BeautifulSoup(html, "lxml")
-            props = self._parse_cards(soup, city)
-            for p in props:
-                p["listing_type"] = listing_type
-            return props
-        except Exception as e:
-            logger.debug(f"[NoBroker] HTML scrape failed: {e}")
-            return []
-        finally:
-            pw_page.close()
-
-    def _parse_cards(self, soup: BeautifulSoup, city: str) -> list[dict]:
-        results = []
-        cards = soup.select(".search-result-card, .property-card, [data-id]")
-        for card in cards:
-            try:
-                prop_id = card.get("data-id", "")
-                title_el = card.select_one("h3, .title, .property-title")
-                price_el = card.select_one(".price, .property-price")
-                loc_el   = card.select_one(".locality, .property-locality, .location")
-                area_el  = card.select_one(".area, .property-area")
-                link_el  = card.select_one("a[href]")
-                img_el   = card.select_one("img")
-
-                title     = title_el.get_text(strip=True) if title_el else ""
-                price_text = price_el.get_text(strip=True) if price_el else ""
-                locality  = loc_el.get_text(strip=True) if loc_el else ""
-                area_text = area_el.get_text(strip=True) if area_el else ""
-                url       = link_el["href"] if link_el else ""
-                if url and not url.startswith("http"):
-                    url = BASE_URL + url
-                image_url = img_el.get("data-src") or img_el.get("src", "") if img_el else ""
-
-                bhk_match = re.search(r"(\d)\s*BHK", title, re.I)
-                bhk = int(bhk_match.group(1)) if bhk_match else 0
-
-                results.append(self._normalize({
-                    "source": self.source_name,
-                    "property_id": prop_id or url[-12:],
-                    "title": title,
-                    "price": self._parse_price(price_text),
-                    "price_text": price_text,
-                    "area_sqft": self._parse_area(area_text),
-                    "bhk": bhk,
-                    "city": city,
-                    "locality": locality,
-                    "url": url,
-                    "image_url": image_url,
-                }))
-            except Exception as e:
-                logger.debug(f"[NoBroker] card parse error: {e}")
-        return results
-
-    @staticmethod
-    def _format_price(price: int) -> str:
-        if price >= 1_00_00_000:
-            return f"₹{price / 1_00_00_000:.2f} Cr"
-        elif price >= 1_00_000:
-            return f"₹{price / 1_00_000:.1f} Lac"
-        return f"₹{price:,}"
+        bhk_m = re.search(r"(\d+)", str(o.get("type") or ""))
+        price = o.get("rent") if listing_type == "rent" else o.get("price")
+        price = int(price or o.get("price") or o.get("rent") or 0)
+        image = _image_url(o)
+        floor, total = o.get("floor"), o.get("totalFloor")
+        lat, lng = o.get("latitude"), o.get("longitude")
+        return self._normalize(
+            {
+                "source": self.source_name,
+                "property_id": str(prop_id),
+                "listing_type": listing_type,
+                "title": _text(o.get("propertyTitle")),
+                "price": price,
+                "price_text": "",
+                "area_sqft": float(o.get("propertySize") or o.get("carpetArea") or 0),
+                "bhk": int(bhk_m.group(1)) if bhk_m else 0,
+                "city": city,
+                "locality": _text(o.get("locality")).rstrip(","),
+                "address": _text(o.get("society") or o.get("secondaryTitle")),
+                "latitude": float(lat) if lat else None,
+                "longitude": float(lng) if lng else None,
+                "url": urljoin(BASE_URL, o.get("detailUrl") or ""),
+                "image_url": image,
+                "furnishing": _furnishing(o.get("furnishing") or o.get("furnishingDesc")),
+                "floor": f"{floor} out of {total}" if floor is not None and total else str(floor or ""),
+                "total_floors": int(total or 0),
+                "facing": o.get("facingDesc") or _FACING.get(str(o.get("facing") or "").upper(), o.get("facing") or ""),
+                # Details
+                "posted_date": ms_to_date(
+                    o.get("lastActivationDate") or o.get("activationDate") or o.get("creationDate")
+                ),
+                "updated_date": ms_to_date(o.get("lastUpdateDate")),
+                "available_from": ms_to_date(o.get("availableFrom")),
+                "tenant_preference": _tenants(o),
+                "pets_allowed": yes_no(_attr(o, "PET")),
+                "non_veg_allowed": yes_no(_attr(o, "NON_VEG_ALLOWED")),
+                "amenities": _amenities(o),
+                "deposit": int(o.get("deposit") or 0),
+                "maintenance": int(o.get("maintenanceAmount") or o.get("maintenanceCost") or 0),
+                "occupancy": _attr(o, "CURRENT_SITUATION", display=True),
+                "description": _text(_unquote(o.get("ownerDescription"))),
+            }
+        )

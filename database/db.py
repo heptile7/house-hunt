@@ -1,10 +1,25 @@
-import sqlite3
 import json
 import logging
-from datetime import datetime, timezone
+import sqlite3
+from datetime import UTC, datetime
+
 from config import DB_PATH
 
 logger = logging.getLogger(__name__)
+
+
+# Added after the original schema (migration 3). Keep in sync with BaseScraper._normalize.
+DETAIL_COLUMNS = {
+    "updated_date": "TEXT",
+    "available_from": "TEXT",
+    "tenant_preference": "TEXT",
+    "pets_allowed": "INTEGER",
+    "non_veg_allowed": "INTEGER",
+    "deposit": "INTEGER",
+    "maintenance": "INTEGER",
+    "occupancy": "TEXT",
+    "description": "TEXT",
+}
 
 
 def get_conn():
@@ -108,6 +123,14 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_bhk    ON properties(bhk);
         """)
 
+    # Migration 3: listing-detail columns (posted/move-in dates, restrictions, costs, description)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(properties)").fetchall()]
+    for name, decl in DETAIL_COLUMNS.items():
+        if name not in cols:
+            conn.execute(f"ALTER TABLE properties ADD COLUMN {name} {decl}")
+
+    # After migrations: a table rebuild above drops all indexes.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_locality ON properties(city, listing_type, locality)")
     conn.commit()
     conn.close()
 
@@ -116,24 +139,29 @@ def upsert_properties(properties: list[dict]) -> int:
     if not properties:
         return 0
     conn = get_conn()
-    now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    now = datetime.now(UTC).replace(tzinfo=None).isoformat()
     inserted = 0
     for p in properties:
         amenities = json.dumps(p.get("amenities", []))
         try:
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT INTO properties
                     (source, property_id, listing_type, title, price, price_text, area_sqft, bhk,
                      property_type, city, locality, address, latitude, longitude,
                      amenities, image_url, url, furnishing, posted_date,
                      is_new_project, builder_name, rera_id, floor, total_floors,
-                     facing, parking, updated_at)
+                     facing, parking, updated_at,
+                     updated_date, available_from, tenant_preference, pets_allowed, non_veg_allowed,
+                     deposit, maintenance, occupancy, description)
                 VALUES
                     (:source, :property_id, :listing_type, :title, :price, :price_text, :area_sqft, :bhk,
                      :property_type, :city, :locality, :address, :latitude, :longitude,
                      :amenities, :image_url, :url, :furnishing, :posted_date,
                      :is_new_project, :builder_name, :rera_id, :floor, :total_floors,
-                     :facing, :parking, :updated_at)
+                     :facing, :parking, :updated_at,
+                     :updated_date, :available_from, :tenant_preference, :pets_allowed, :non_veg_allowed,
+                     :deposit, :maintenance, :occupancy, :description)
                 ON CONFLICT(source, property_id, listing_type) DO UPDATE SET
                     -- Refresh fields, but never overwrite a known value with a blank/zero one.
                     title        = COALESCE(NULLIF(excluded.title, ''),      title),
@@ -145,8 +173,26 @@ def upsert_properties(properties: list[dict]) -> int:
                     image_url    = COALESCE(NULLIF(excluded.image_url, ''),  image_url),
                     url          = COALESCE(NULLIF(excluded.url, ''),        url),
                     furnishing   = COALESCE(NULLIF(NULLIF(excluded.furnishing, ''), 'Unknown'), furnishing),
+                    latitude     = COALESCE(excluded.latitude,  latitude),
+                    longitude    = COALESCE(excluded.longitude, longitude),
+                    property_type = COALESCE(NULLIF(excluded.property_type, ''), property_type),
+                    amenities    = COALESCE(NULLIF(excluded.amenities, '[]'), amenities),
+                    posted_date  = COALESCE(NULLIF(excluded.posted_date, ''),  posted_date),
+                    updated_date = COALESCE(NULLIF(excluded.updated_date, ''), updated_date),
+                    available_from    = COALESCE(NULLIF(excluded.available_from, ''),    available_from),
+                    tenant_preference = COALESCE(NULLIF(excluded.tenant_preference, ''), tenant_preference),
+                    pets_allowed      = COALESCE(excluded.pets_allowed,    pets_allowed),
+                    non_veg_allowed   = COALESCE(excluded.non_veg_allowed, non_veg_allowed),
+                    deposit      = COALESCE(NULLIF(excluded.deposit, 0),      deposit),
+                    maintenance  = COALESCE(NULLIF(excluded.maintenance, 0),  maintenance),
+                    occupancy    = COALESCE(NULLIF(excluded.occupancy, ''),   occupancy),
+                    description  = COALESCE(NULLIF(excluded.description, ''), description),
+                    floor        = COALESCE(NULLIF(excluded.floor, ''),       floor),
+                    facing       = COALESCE(NULLIF(excluded.facing, ''),      facing),
                     updated_at   = excluded.updated_at
-            """, {**p, "amenities": amenities, "updated_at": now})
+            """,
+                {**p, "amenities": amenities, "updated_at": now},
+            )
             inserted += conn.execute("SELECT changes()").fetchone()[0]
         except Exception as e:
             logger.warning("upsert failed for %s/%s: %s", p.get("source"), p.get("property_id"), e)
@@ -175,11 +221,42 @@ def query_properties(
     price_max: int = None,
     area_min: float = None,
     area_max: float = None,
+    localities: list[str] = None,
+    pets_allowed: bool = False,
+    non_veg_allowed: bool = False,
+    posted_within_days: int = None,
+    available_by: str = None,
     limit: int = 500,
 ) -> list[dict]:
+    """available_by: ISO date — keep listings you can move into by then (immediate /
+    ready-to-move, or an available_from date on or before it)."""
     conn = get_conn()
     conditions = ["city = ?", "listing_type = ?"]
     params: list = [city, listing_type]
+
+    if pets_allowed:
+        conditions.append("pets_allowed = 1")
+    if non_veg_allowed:
+        conditions.append("non_veg_allowed = 1")
+    if posted_within_days:
+        conditions.append("COALESCE(NULLIF(posted_date, ''), updated_date) >= date('now', '+330 minutes', ?)")
+        params.append(f"-{int(posted_within_days)} days")
+    if available_by:
+        conditions.append(
+            "(available_from IN ('Immediately', 'Ready to move')"
+            " OR (available_from GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND available_from <= ?))"
+        )
+        params.append(available_by)
+
+    # Locality names vary across sites ("Anna Nagar" / "Annanagar East" / in the title only),
+    # so match each requested locality as a substring of locality, title or address.
+    locs = [loc.strip() for loc in (localities or []) if loc and loc.strip()]
+    if locs:
+        ors = []
+        for loc in locs:
+            ors.append("(locality LIKE ? OR title LIKE ? OR address LIKE ?)")
+            params.extend([f"%{loc}%"] * 3)
+        conditions.append("(" + " OR ".join(ors) + ")")
 
     if sources:
         placeholders = ",".join("?" * len(sources))
@@ -212,13 +289,23 @@ def query_properties(
         [*params, limit],
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return [_row_out(r) for r in rows]
+
+
+def _row_out(row) -> dict:
+    d = dict(row)
+    try:
+        d["amenities"] = json.loads(d.get("amenities") or "[]")
+    except ValueError:
+        d["amenities"] = []
+    return d
 
 
 def get_source_status(city: str) -> list[dict]:
     """Latest scrape log per source for the city, plus last-successful-fetch info."""
     conn = get_conn()
-    rows = conn.execute("""
+    rows = conn.execute(
+        """
         SELECT l.source, l.status, l.properties_fetched, l.error_message, l.scraped_at
         FROM scrape_logs l
         INNER JOIN (
@@ -228,14 +315,19 @@ def get_source_status(city: str) -> list[dict]:
         ) m ON l.source = m.source AND l.scraped_at = m.latest
         WHERE l.city = ?
         ORDER BY l.source
-    """, (city, city)).fetchall()
+    """,
+        (city, city),
+    ).fetchall()
 
-    last_good = conn.execute("""
+    last_good = conn.execute(
+        """
         SELECT source, MAX(scraped_at) AS last_success, MAX(properties_fetched) AS best_count
         FROM scrape_logs
         WHERE city = ? AND status = 'success' AND properties_fetched > 0
         GROUP BY source
-    """, (city,)).fetchall()
+    """,
+        (city,),
+    ).fetchall()
 
     conn.close()
 
@@ -258,6 +350,24 @@ def get_last_scrape(city: str) -> dict | None:
     ).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def get_localities(city: str, listing_type: str = "buy", limit: int = 300) -> list[dict]:
+    """Distinct saved localities for a city, most listings first (for the locality picker)."""
+    conn = get_conn()
+    rows = conn.execute(
+        """
+        SELECT TRIM(locality) AS locality, COUNT(*) AS count
+        FROM properties
+        WHERE city = ? AND listing_type = ? AND TRIM(COALESCE(locality, '')) <> ''
+        GROUP BY TRIM(locality) COLLATE NOCASE
+        ORDER BY count DESC, locality
+        LIMIT ?
+    """,
+        (city, listing_type, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def get_property_count(city: str, listing_type: str = "buy") -> int:

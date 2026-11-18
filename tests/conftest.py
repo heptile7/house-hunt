@@ -1,4 +1,3 @@
-import os
 import sys
 import tempfile
 from pathlib import Path
@@ -27,16 +26,26 @@ def tmp_db(tmp_path, monkeypatch):
 @pytest.fixture
 def client(tmp_db):
     import app as app_module
+
     app_module.app.config["TESTING"] = True
     return app_module.app.test_client()
 
 
 def make_prop(**overrides) -> dict:
     from scrapers.base_scraper import BaseScraper
+
     base = {
-        "source": "magicbricks", "property_id": "1", "listing_type": "buy",
-        "title": "2 BHK Apartment", "price": 5_000_000, "price_text": "50 Lac",
-        "area_sqft": 1000.0, "bhk": 2, "city": "Chennai", "locality": "Adyar",
-        "url": "https://example.com/1", "image_url": "https://example.com/1.jpg",
+        "source": "magicbricks",
+        "property_id": "1",
+        "listing_type": "buy",
+        "title": "2 BHK Apartment",
+        "price": 5_000_000,
+        "price_text": "50 Lac",
+        "area_sqft": 1000.0,
+        "bhk": 2,
+        "city": "Chennai",
+        "locality": "Adyar",
+        "url": "https://example.com/1",
+        "image_url": "https://example.com/1.jpg",
     }
     return BaseScraper._normalize({**base, **overrides})

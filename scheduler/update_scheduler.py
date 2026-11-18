@@ -3,6 +3,7 @@ Background scheduler that refreshes property data every N hours.
 Can be run standalone:   python -m scheduler.update_scheduler
 Or imported and started as a daemon thread from app.py.
 """
+
 import logging
 import threading
 from datetime import datetime
@@ -11,7 +12,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from config import SCRAPER_CONFIG, SOURCES
-from database.db import upsert_properties, log_scrape
+from database.db import log_scrape, upsert_properties
 
 logger = logging.getLogger(__name__)
 
@@ -19,26 +20,38 @@ _scheduler: BackgroundScheduler | None = None
 _lock = threading.Lock()
 
 
-def run_scrapers(city: str, bhk: list[int] = None, max_price: int = None,
-                 listing_type: str = "buy", progress_cb=None):
+def get_scraper_classes() -> dict:
+    """Active scrapers, in config.SOURCES order. 99acres/Housing are kept in scrapers/
+    but not listed here (see config.DISABLED_SOURCES)."""
+    from scrapers.commonfloor import CommonFloorScraper
     from scrapers.magicbricks import MagicBricksScraper
-    from scrapers.acres99 import Acres99Scraper
     from scrapers.nobroker import NoBrokerScraper
-    from scrapers.housing import HousingScraper
+    from scrapers.squareyards import SquareYardsScraper
 
-    scraper_map = {
+    available = {
+        "nobroker": NoBrokerScraper,
+        "squareyards": SquareYardsScraper,
         "magicbricks": MagicBricksScraper,
-        "99acres":     Acres99Scraper,
-        "nobroker":    NoBrokerScraper,
-        "housing":     HousingScraper,
+        "commonfloor": CommonFloorScraper,
     }
+    return {name: available[name] for name in SOURCES if name in available}
 
+
+def run_scrapers(
+    city: str,
+    bhk: list[int] = None,
+    max_price: int = None,
+    listing_type: str = "buy",
+    progress_cb=None,
+    localities: list[str] = None,
+):
     results = {}
-    for name, cls in scraper_map.items():
+    for name, cls in get_scraper_classes().items():
         try:
-            logger.info(f"[Scheduler] Scraping {name} for {city} ({listing_type})...")
+            where = f"{city} / {', '.join(localities)}" if localities and cls.supports_localities else city
+            logger.info(f"[Scheduler] Scraping {name} for {where} ({listing_type})...")
             scraper = cls()
-            props = scraper.scrape(city, bhk=bhk, max_price=max_price, listing_type=listing_type)
+            props = scraper.scrape(city, bhk=bhk, max_price=max_price, listing_type=listing_type, localities=localities)
             count = upsert_properties(props)
             scraped = len(props)
             status = "success" if scraped > 0 else "blocked"
@@ -111,6 +124,7 @@ def update_city(city: str, bhk: list[int] = None, max_price: int = None):
 
 if __name__ == "__main__":
     import sys
+
     logging.basicConfig(level=logging.INFO)
     city = sys.argv[1] if len(sys.argv) > 1 else "Bangalore"
     logger.info(f"Running standalone scheduler for {city}")

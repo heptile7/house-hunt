@@ -1,0 +1,17 @@
+line-length = 120
+target-version = "py311"
+extend-exclude = ["tests/fixtures", ".venv"]
+
+[lint]
+# pyflakes, pycodestyle errors, import sorting, pyupgrade, bugbear basics
+select = ["F", "E", "I", "UP", "B"]
+ignore = [
+    "E501",   # long lines: the formatter handles what it can
+    "B008",   # function calls in defaults
+]
+
+[lint.per-file-ignores]
+# sys.path / load_dotenv must run before project imports
+"app.py" = ["E402"]
+"mcp_server.py" = ["E402"]
+"tests/conftest.py" = ["E402"]

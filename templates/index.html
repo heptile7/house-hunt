@@ -40,6 +40,18 @@
       </div>
 
       <div class="mb-3">
+        <label class="filter-label" for="locality-input">Localities</label>
+        <div class="input-group input-group-sm">
+          <input type="text" class="form-control" id="locality-input" list="locality-options"
+                 placeholder="e.g. Velachery" autocomplete="off">
+          <button class="btn btn-outline-secondary" type="button" id="locality-add" title="Add locality">+</button>
+        </div>
+        <datalist id="locality-options"></datalist>
+        <div id="locality-chips" class="d-flex flex-wrap gap-1 mt-1"></div>
+        <div class="form-text" style="font-size:0.7rem">Filters results. Fetch Now also searches these localities directly.</div>
+      </div>
+
+      <div class="mb-3">
         <label class="filter-label">BHK</label>
         <div class="d-flex flex-wrap gap-2">
           {% for b in bhk_options %}
@@ -83,6 +95,35 @@
       </div>
 
       <div class="mb-3">
+        <label class="filter-label">Lifestyle &amp; timing</label>
+        <div class="form-check">
+          <input class="form-check-input detail-filter" type="checkbox" id="f-pets">
+          <label class="form-check-label small" for="f-pets">&#128062; Pets allowed</label>
+        </div>
+        <div class="form-check">
+          <input class="form-check-input detail-filter" type="checkbox" id="f-nonveg">
+          <label class="form-check-label small" for="f-nonveg">&#127831; Non-veg allowed</label>
+        </div>
+        <div class="row g-2 mt-1">
+          <div class="col-6">
+            <label class="filter-label" for="f-posted">Posted within</label>
+            <select class="form-select form-select-sm detail-filter" id="f-posted">
+              <option value="">Any time</option>
+              <option value="3">3 days</option>
+              <option value="7">1 week</option>
+              <option value="14">2 weeks</option>
+              <option value="30">1 month</option>
+            </select>
+          </div>
+          <div class="col-6">
+            <label class="filter-label" for="f-available-by">Move in by</label>
+            <input type="date" class="form-control form-control-sm detail-filter" id="f-available-by">
+          </div>
+        </div>
+        <div class="form-text" style="font-size:0.7rem">Only listings that state these are shown when a filter is on.</div>
+      </div>
+
+      <div class="mb-3">
         <label class="filter-label">Sources</label>
         {% for key, label in sources.items() %}
         <div class="form-check">
@@ -99,6 +140,8 @@
             <option value="price">Price</option>
             <option value="area_sqft">Area</option>
             <option value="bhk">BHK</option>
+            <option value="posted">Newest posted</option>
+            <option value="available">Earliest move-in</option>
           </select>
           <select class="form-select form-select-sm" id="sort-order">
             <option value="asc">&#8593; Asc</option>
@@ -253,6 +296,7 @@
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>window.APP_SOURCES = {{ sources|tojson }};</script>
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>

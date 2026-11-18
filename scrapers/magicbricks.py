@@ -1,10 +1,13 @@
+import json
 import logging
 import re
-import json
 from urllib.parse import urljoin
+
 from bs4 import BeautifulSoup
-from scrapers.base_scraper import BaseScraper
+
 from config import CITY_SLUGS
+from scrapers.base_scraper import BaseScraper
+from scrapers.details import parse_availability, parse_date_text
 
 logger = logging.getLogger(__name__)
 
@@ -12,8 +15,8 @@ BASE_URL = "https://www.magicbricks.com"
 
 PROP_TYPE_MAP = {
     "Apartment": "Multistorey-Apartment,Builder-Floor-Apartment,Studio-Apartment",
-    "Villa":     "Villa",
-    "Plot":      "Residential-Plot",
+    "Villa": "Villa",
+    "Plot": "Residential-Plot",
     "Penthouse": "Penthouse",
 }
 
@@ -21,7 +24,14 @@ PROP_TYPE_MAP = {
 class MagicBricksScraper(BaseScraper):
     source_name = "magicbricks"
 
-    def scrape(self, city: str, bhk: list[int] = None, max_price: int = None, listing_type: str = "buy") -> list[dict]:
+    def scrape(
+        self,
+        city: str,
+        bhk: list[int] = None,
+        max_price: int = None,
+        listing_type: str = "buy",
+        localities: list[str] = None,
+    ) -> list[dict]:
         city_slug = CITY_SLUGS.get(city, {}).get("mb", city)
         results = []
         for page in range(1, self.max_pages + 1):
@@ -86,16 +96,20 @@ class MagicBricksScraper(BaseScraper):
         if not prop_id:
             return None
         price_raw = item.get("offers", {}).get("price", "0")
-        return self._normalize({
-            "source": self.source_name,
-            "property_id": prop_id.group(1),
-            "title": item.get("name", ""),
-            "price": self._parse_price(str(price_raw)),
-            "price_text": str(price_raw),
-            "city": city,
-            "url": url,
-            "image_url": (item.get("image") or [""])[0] if isinstance(item.get("image"), list) else item.get("image", ""),
-        })
+        return self._normalize(
+            {
+                "source": self.source_name,
+                "property_id": prop_id.group(1),
+                "title": item.get("name", ""),
+                "price": self._parse_price(str(price_raw)),
+                "price_text": str(price_raw),
+                "city": city,
+                "url": url,
+                "image_url": (item.get("image") or [""])[0]
+                if isinstance(item.get("image"), list)
+                else item.get("image", ""),
+            }
+        )
 
     def _parse_cards(self, soup: BeautifulSoup, city: str) -> list[dict]:
         """Parse search-result cards (markup as of 2026-11: div.mb-srp__card with an
@@ -142,24 +156,35 @@ class MagicBricksScraper(BaseScraper):
         floor = summary.get("floor", "")
         total_floors_m = re.search(r"out of\s+(\d+)", floor)
         price_text = text(".mb-srp__card__price--amount")
+        posted = text(".mb-srp__card__photo__fig--post")
         img = card.select_one("img.mb-srp__card__photo__fig--graphic, img")
         image_url = (img.get("data-src") or img.get("src") or "") if img else ""
 
-        return self._normalize({
-            "source": self.source_name,
-            "property_id": prop_id,
-            "title": title,
-            "price": self._parse_price(price_text),
-            "price_text": price_text,
-            "area_sqft": self._parse_area(area_text),
-            "bhk": int(bhk_m.group(1)) if bhk_m else 0,
-            "city": city,
-            "locality": locality,
-            "address": text(".mb-srp__card__society--name"),
-            "url": url,
-            "image_url": image_url if image_url.startswith("http") else "",
-            "furnishing": summary.get("furnishing") or "Unknown",
-            "floor": floor,
-            "total_floors": int(total_floors_m.group(1)) if total_floors_m else 0,
-            "facing": summary.get("facing", ""),
-        })
+        return self._normalize(
+            {
+                "source": self.source_name,
+                "property_id": prop_id,
+                "title": title,
+                "price": self._parse_price(price_text),
+                "price_text": price_text,
+                "area_sqft": self._parse_area(area_text),
+                "bhk": int(bhk_m.group(1)) if bhk_m else 0,
+                "city": city,
+                "locality": locality,
+                "address": text(".mb-srp__card__society--name"),
+                "url": url,
+                "image_url": image_url if image_url.startswith("http") else "",
+                "furnishing": summary.get("furnishing") or "Unknown",
+                "floor": floor,
+                "total_floors": int(total_floors_m.group(1)) if total_floors_m else 0,
+                "facing": summary.get("facing", ""),
+                # Details: "Posted: Nov 06, '26" / "Posted: Yesterday" / "Updated today"
+                "posted_date": parse_date_text(posted) if posted.lower().startswith("posted") else "",
+                "updated_date": parse_date_text(posted) if posted.lower().startswith("updated") else "",
+                # "Immediately" / "From Dec '26" / "Ready to Move" / "Poss. by Jun '27"
+                "available_from": parse_availability(summary.get("status", "")),
+                "tenant_preference": summary.get("tenent-preffered", ""),
+                "amenities": [f"Overlooking {summary['overlooking']}"] if summary.get("overlooking") else [],
+                "description": text(".mb-srp__card--desc--text"),
+            }
+        )
