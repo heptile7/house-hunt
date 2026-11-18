@@ -1,6 +1,7 @@
 import logging
 import re
 import json
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from scrapers.base_scraper import BaseScraper
 from config import CITY_SLUGS
@@ -51,7 +52,10 @@ class MagicBricksScraper(BaseScraper):
         resp = self._get(url, headers=headers)
         soup = BeautifulSoup(resp.text, "lxml")
 
-        props = self._parse_json_ld(soup, city) or self._parse_cards(soup, city)
+        if "down for maintenance" in resp.text[:10_000]:
+            raise RuntimeError("MagicBricks returned its maintenance page")
+        # Cards carry far more detail than JSON-LD; JSON-LD is only a fallback.
+        props = self._parse_cards(soup, city) or self._parse_json_ld(soup, city)
         for p in props:
             p["listing_type"] = listing_type
         return props
@@ -94,48 +98,68 @@ class MagicBricksScraper(BaseScraper):
         })
 
     def _parse_cards(self, soup: BeautifulSoup, city: str) -> list[dict]:
+        """Parse search-result cards (markup as of 2026-11: div.mb-srp__card with an
+        h2.mb-srp__card--title and [data-summary] key/value items)."""
         results = []
-        cards = soup.select("div.mb-srp__card")
-        if not cards:
-            cards = soup.select("[data-id]")
-
-        for card in cards:
+        for card in soup.select("div.mb-srp__card"):
             try:
-                prop_id = card.get("data-id", "") or card.get("id", "")
-                title_el = card.select_one(".mb-srp__card__title, h2.title, .listing-title")
-                price_el = card.select_one(".mb-srp__card__price--amount, .price, .rupees")
-                loc_el   = card.select_one(".mb-srp__card__addr, .locality, .address")
-                area_el  = card.select_one(".mb-srp__card__summary--area, .area")
-                link_el  = card.select_one("a[href]")
-                img_el   = card.select_one("img")
-
-                title = title_el.get_text(strip=True) if title_el else ""
-                price_text = price_el.get_text(strip=True) if price_el else ""
-                locality = loc_el.get_text(strip=True) if loc_el else ""
-                area_text = area_el.get_text(strip=True) if area_el else ""
-                url = (BASE_URL + link_el["href"]) if link_el else ""
-                image_url = img_el.get("data-src") or img_el.get("src", "") if img_el else ""
-
-                bhk_match = re.search(r"(\d)\s*BHK", title, re.I)
-                bhk = int(bhk_match.group(1)) if bhk_match else 0
-
-                if not prop_id and url:
-                    m = re.search(r"-(\d+)\.html", url)
-                    prop_id = m.group(1) if m else url[-12:]
-
-                results.append(self._normalize({
-                    "source": self.source_name,
-                    "property_id": prop_id,
-                    "title": title,
-                    "price": self._parse_price(price_text),
-                    "price_text": price_text,
-                    "area_sqft": self._parse_area(area_text),
-                    "bhk": bhk,
-                    "city": city,
-                    "locality": locality,
-                    "url": url,
-                    "image_url": image_url,
-                }))
+                p = self._parse_card(card, city)
+                if p:
+                    results.append(p)
             except Exception as e:
                 logger.debug(f"[MagicBricks] card parse error: {e}")
         return results
+
+    def _parse_card(self, card, city: str) -> dict | None:
+        def text(sel: str) -> str:
+            el = card.select_one(sel)
+            return el.get_text(" ", strip=True) if el else ""
+
+        summary = {}
+        for item in card.select("[data-summary]"):
+            val = item.select_one(".mb-srp__card__summary--value")
+            if val and item["data-summary"] not in summary:
+                summary[item["data-summary"]] = val.get_text(" ", strip=True)
+
+        # The listing's own page is /propertyDetails/...&id=<hex>; other links point at the
+        # project/society page, which many listings share, so they're useless as an ID.
+        hrefs = [a["href"] for a in card.select("a[href]")]
+        detail = next((h for h in hrefs if "propertyDetails" in h), "")
+        m = re.search(r"[?&]id=([0-9a-fA-F]+)", detail)
+        if not m:
+            return None
+        prop_id = m.group(1)
+        url = urljoin(BASE_URL + "/", detail)
+
+        title = re.sub(r"\s+", " ", text(".mb-srp__card--title"))
+        bhk_m = re.search(r"(\d+)\s*BHK", title, re.I)
+        # "2 BHK Flat for Rent in Karapakkam, Chennai" / "...in Neelankarai Chennai" → locality
+        loc_m = re.search(r"\bin\s+(.+)$", title)
+        locality = loc_m.group(1).strip() if loc_m else ""
+        locality = re.sub(rf"[,\s]*\b{re.escape(city)}$", "", locality, flags=re.I).strip(" ,")
+
+        area_text = next((summary[k] for k in ("carpet-area", "super-area", "plot-area") if k in summary), "")
+        floor = summary.get("floor", "")
+        total_floors_m = re.search(r"out of\s+(\d+)", floor)
+        price_text = text(".mb-srp__card__price--amount")
+        img = card.select_one("img.mb-srp__card__photo__fig--graphic, img")
+        image_url = (img.get("data-src") or img.get("src") or "") if img else ""
+
+        return self._normalize({
+            "source": self.source_name,
+            "property_id": prop_id,
+            "title": title,
+            "price": self._parse_price(price_text),
+            "price_text": price_text,
+            "area_sqft": self._parse_area(area_text),
+            "bhk": int(bhk_m.group(1)) if bhk_m else 0,
+            "city": city,
+            "locality": locality,
+            "address": text(".mb-srp__card__society--name"),
+            "url": url,
+            "image_url": image_url if image_url.startswith("http") else "",
+            "furnishing": summary.get("furnishing") or "Unknown",
+            "floor": floor,
+            "total_floors": int(total_floors_m.group(1)) if total_floors_m else 0,
+            "facing": summary.get("facing", ""),
+        })
